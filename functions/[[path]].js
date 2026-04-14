@@ -4,7 +4,7 @@ const UPSTREAM_FALLBACK = 'https://rhpcv957tj.cloudflare-gateway.com/dns-query';
 const UPSTREAM_GEO_BYPASS = 'https://dns.mullvad.net/dns-query'; // Re-resolve without ECS when geo-block returns loopback
 const UPSTREAM_TIMEOUT = 5000;
 
-// Refresh interval for ALL lists (blocklist, private TLDs, redirect rules)
+// Refresh interval for ALL lists (blocklist, allowlists, private TLDs, redirect rules)
 const ALL_LISTS_REFRESH_INTERVAL = 3600000; // 1 hour
 
 const AD_BLOCK_ENABLED = true;
@@ -239,7 +239,8 @@ function isDomainPrivate(domain) {
   return false;
 }
 
-// FIX #1: Mirror all query flags (Opcode, AA, TC, RD) per RFC 1035
+// Build NXDOMAIN response (RCODE=3) - Domain does not exist
+// Mirrors query flags (Opcode, AA, TC, RD) per RFC 1035
 function buildNxdomain(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
@@ -322,7 +323,8 @@ function buildServfail(query) {
 }
 
 // ==================== ECS INJECTION ====================
-// FIX #2 + #6: Correct ARCOUNT increment + mask trailing bits per RFC 7871
+// Inject EDNS Client Subnet (ECS) into DNS query per RFC 7871
+// Adds client subnet info for geo-optimized CDN responses
 function injectECS(query, clientIP) {
   if (!ECS_INJECTION_ENABLED || !clientIP || clientIP === 'unknown') return query;
   try {
@@ -341,7 +343,7 @@ function injectECS(query, clientIP) {
     if (clientIP.includes(':')) {
       family = 2; prefixLen = ECS_PREFIX_V6;
       const allBytes = ipv6ToBytes(clientIP);
-      if (!allBytes) return query; // FIX #5: invalid IPv6
+      if (!allBytes) return query; // Invalid IPv6 address, skip ECS injection
       const byteLen = Math.ceil(prefixLen / 8);
       addrBytes = allBytes.slice(0, byteLen);
     } else {
@@ -352,7 +354,7 @@ function injectECS(query, clientIP) {
       addrBytes = parts.slice(0, byteLen).map(Number);
     }
 
-    // FIX #6: Mask unused trailing bits in the last byte
+    // Mask unused trailing bits per RFC 7871 (e.g., /24 prefix → mask last byte)
     if (addrBytes.length > 0 && prefixLen % 8 !== 0) {
       const maskBits = prefixLen % 8;
       const mask = (0xFF << (8 - maskBits)) & 0xFF;
@@ -376,7 +378,7 @@ function injectECS(query, clientIP) {
     opt[9] = (ecs.length >> 8) & 0xFF; opt[10] = ecs.length & 0xFF;
     opt.set(ecs, 11);
 
-    // FIX #2: Read current ARCOUNT from stripped buffer, add 1 for new OPT
+    // Increment ARCOUNT to account for new OPT record
     const currentArCount = (clean[10] << 8) | clean[11];
     const newArCount = currentArCount + 1;
 
@@ -389,7 +391,8 @@ function injectECS(query, clientIP) {
   } catch { return query; }
 }
 
-// FIX #3: Validate rdata bounds, use keptRecords.length for ARCOUNT
+// Strip existing OPT (EDNS) records from DNS query
+// Validates rdata bounds and correctly rebuilds ARCOUNT
 function stripOPT(view) {
   let off = 12;
   const qd = (view[4] << 8) | view[5];
@@ -430,7 +433,7 @@ function stripOPT(view) {
     if (arOff + 10 > view.length) break;
     const type = (view[arOff] << 8) | view[arOff + 1];
     const rdlen = (view[arOff + 8] << 8) | view[arOff + 9];
-    // FIX #3: Validate rdata fits in the buffer
+    // Validate rdata length fits within buffer bounds
     if (arOff + 10 + rdlen > view.length) break;
     arOff += 10 + rdlen;
     if (type !== 41) {
@@ -447,13 +450,14 @@ function stripOPT(view) {
     r.set(rec, writeOff);
     writeOff += rec.length;
   }
-  // FIX #3: ARCOUNT = number of kept records (not ar - optDropped)
+  // Set ARCOUNT to number of kept additional records (excluding removed OPT)
   r[10] = (keptRecords.length >> 8) & 0xFF;
   r[11] = keptRecords.length & 0xFF;
   return r;
 }
 
-// FIX #5: Validate IPv6 format, reject invalid input
+// Convert IPv6 address string to 16-byte array
+// Validates format, handles :: compression, rejects invalid input
 function ipv6ToBytes(ip) {
   try {
     if (!ip || typeof ip !== 'string') return null;
@@ -627,7 +631,8 @@ async function forwardQuery(query, upstream) {
   return await res.arrayBuffer();
 }
 
-// FIX #7: Never return loopback to client — return NXDOMAIN instead
+// Resolve DNS query with fallback and geo-bypass logic
+// Returns SERVFAIL on upstream errors, NXDOMAIN for geo-blocked domains
 async function resolveQuery(query, clientIP) {
   const processed = injectECS(query, clientIP);
   let result;
@@ -637,7 +642,7 @@ async function resolveQuery(query, clientIP) {
     try {
       result = await forwardQuery(processed, UPSTREAM_FALLBACK);
     } catch {
-      // Both primary and fallback failed → SERVFAIL
+      // Both primary and fallback upstream failed
       return buildServfail(query);
     }
   }
@@ -650,7 +655,7 @@ async function resolveQuery(query, clientIP) {
       // Mullvad success nhưng vẫn có loopback → geo-block thực sự
       return buildNxdomain(query);
     } catch {
-      // Mullvad fail (timeout, network error) → SERVFAIL
+      // Mullvad upstream failed (timeout or network error)
       return buildServfail(query);
     }
   }
