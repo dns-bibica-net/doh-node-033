@@ -29,6 +29,10 @@ const PRIVATE_TLD_URL = '/rules/private_tlds.txt';
 const DNS_REDIRECT_ENABLED = true;
 const REDIRECT_RULES_URL = '/rules/redirect_rules.txt';
 
+// Dedicated Mullvad Upstream Domains
+const MULLVAD_UPSTREAM_ENABLED = true;
+const MULLVAD_UPSTREAM_URL = '/rules/mullvad_upstream.txt';
+
 // /debug endpoint — set to true only when needed, false by default to avoid unnecessary requests
 const DEBUG_ENABLED = false;
 
@@ -42,6 +46,7 @@ let adBlocklist = new Set();
 let adAllowlist = new Set();
 let privateTlds = new Set();
 let redirectRules = new Map(); // domain → target domain
+let mullvadUpstreamDomains = new Set();
 let blocklistLastFetch = 0;
 let blocklistPromise = null;
 let blocklistsFetched = false; // Track if lists have been fetched at least once
@@ -90,20 +95,22 @@ async function refreshBlocklists(baseUrl) {
       const bUrl = new URL(BLOCKLIST_URL, baseUrl).toString();
       const aUrl = new URL(ALLOWLIST_URL, baseUrl).toString();
       const pUrl = new URL(PRIVATE_TLD_URL, baseUrl).toString();
-
       const rUrl = new URL(REDIRECT_RULES_URL, baseUrl).toString();
+      const mUrl = new URL(MULLVAD_UPSTREAM_URL, baseUrl).toString();
 
-      const [block, allow, privateList, redirRules] = await Promise.all([
+      const [block, allow, privateList, redirRules, mullvadList] = await Promise.all([
         AD_BLOCK_ENABLED ? fetchList(bUrl) : Promise.resolve(new Set()),
         AD_BLOCK_ENABLED ? fetchList(aUrl) : Promise.resolve(new Set()),
         BLOCK_PRIVATE_TLD ? fetchList(pUrl) : Promise.resolve(new Set()),
-        DNS_REDIRECT_ENABLED ? fetchRedirectRules(rUrl) : Promise.resolve(new Map())
+        DNS_REDIRECT_ENABLED ? fetchRedirectRules(rUrl) : Promise.resolve(new Map()),
+        MULLVAD_UPSTREAM_ENABLED ? fetchList(mUrl) : Promise.resolve(new Set())
       ]);
 
       // Always update state, even if lists are empty (to prevent infinite re-fetch)
       if (AD_BLOCK_ENABLED) { adBlocklist = block; adAllowlist = allow; }
       if (BLOCK_PRIVATE_TLD) { privateTlds = privateList; }
       if (DNS_REDIRECT_ENABLED) { redirectRules = redirRules; }
+      if (MULLVAD_UPSTREAM_ENABLED) { mullvadUpstreamDomains = mullvadList; }
 
       blocklistLastFetch = Date.now();
       blocklistsFetched = true; // Mark as fetched to prevent infinite re-fetch
@@ -241,6 +248,18 @@ function isDomainPrivate(domain) {
     pos++; // Move past the dot
   }
 
+  return false;
+}
+
+// Check if domain matches Mullvad upstream list (suffix match including subdomains)
+function isMullvadDomain(domain) {
+  if (!domain || mullvadUpstreamDomains.size === 0) return false;
+  if (mullvadUpstreamDomains.has(domain)) return true;
+  let pos = 0;
+  while ((pos = domain.indexOf('.', pos)) !== -1) {
+    if (mullvadUpstreamDomains.has(domain.substring(pos + 1))) return true;
+    pos++;
+  }
   return false;
 }
 
@@ -710,13 +729,28 @@ async function handleDNSQuery(request, context) {
   }
 
   // Load data if any domain-based filter is enabled
-  if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED) {
+  if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED || MULLVAD_UPSTREAM_ENABLED) {
     await ensureBlocklistsLoaded(request.url, context);
 
     // Parse domains once for both filters
     const domains = extractAllDomains(query);
     for (const domain of domains) {
       if (!domain) continue;
+
+      // Mullvad Dedicated Upstream
+      if (MULLVAD_UPSTREAM_ENABLED && isMullvadDomain(domain)) {
+        try {
+          const processed = injectECS(query, clientIP);
+          const data = await forwardQuery(processed, UPSTREAM_GEO_BYPASS);
+          return new Response(data, {
+            headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Upstream': 'Mullvad' }
+          });
+        } catch {
+          return new Response(buildServfail(query), {
+            headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Upstream': 'Mullvad-Failed' }
+          });
+        }
+      }
 
       // Private TLD check (NXDOMAIN)
       if (BLOCK_PRIVATE_TLD && isDomainPrivate(domain)) {
@@ -777,7 +811,8 @@ async function handleRequest(request, context) {
       ecs: { enabled: ECS_INJECTION_ENABLED, prefixV4: `/${ECS_PREFIX_V4}`, prefixV6: `/${ECS_PREFIX_V6}` },
       blockedTypes: { ANY: BLOCK_ANY, AAAA: BLOCK_AAAA, PTR: BLOCK_PTR, HTTPS: BLOCK_HTTPS },
       privateTld: { enabled: BLOCK_PRIVATE_TLD, entries: privateTlds.size },
-      dnsRedirect: { enabled: DNS_REDIRECT_ENABLED, rules: redirectRules.size }
+      dnsRedirect: { enabled: DNS_REDIRECT_ENABLED, rules: redirectRules.size },
+      mullvadUpstream: { enabled: MULLVAD_UPSTREAM_ENABLED, entries: mullvadUpstreamDomains.size }
     }, null, 2), { headers: { 'Content-Type': 'application/json' } });
   }
 
